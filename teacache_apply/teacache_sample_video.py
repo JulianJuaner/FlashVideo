@@ -42,128 +42,6 @@ except:
     initialize_model_parallel = None
     init_distributed_environment = None
 
-def parallelize_teacache_transformer(pipe):
-    transformer = pipe.transformer
-    original_forward = transformer.forward
-
-    @functools.wraps(transformer.__class__.forward)
-    def new_forward(
-        self,
-        x: torch.Tensor,
-        t: torch.Tensor,
-        text_states: torch.Tensor = None,
-        text_mask: torch.Tensor = None,
-        text_states_2: Optional[torch.Tensor] = None,
-        freqs_cos: Optional[torch.Tensor] = None,
-        freqs_sin: Optional[torch.Tensor] = None,
-        guidance: torch.Tensor = None,
-        return_dict: bool = True,
-    ):
-        print("parallelize_teacache_transformer")
-        if x.shape[-2] // 2 % get_sequence_parallel_world_size() == 0:
-            # try to split x by height
-            split_dim = -2
-        elif x.shape[-1] // 2 % get_sequence_parallel_world_size() == 0:
-            # try to split x by width
-            split_dim = -1
-        else:
-            raise ValueError(f"Cannot split video sequence into ulysses_degree x ring_degree ({get_sequence_parallel_world_size()}) parts evenly")
-
-        # patch sizes for the temporal, height, and width dimensions are 1, 2, and 2.
-        temporal_size, h, w = x.shape[2], x.shape[3] // 2, x.shape[4] // 2
-
-        x = torch.chunk(x, get_sequence_parallel_world_size(), dim=split_dim)[get_sequence_parallel_rank()]
-
-        dim_thw = freqs_cos.shape[-1]
-        freqs_cos = freqs_cos.reshape(temporal_size, h, w, dim_thw)
-        freqs_cos = torch.chunk(freqs_cos, get_sequence_parallel_world_size(), dim=split_dim - 1)[get_sequence_parallel_rank()]
-        freqs_cos = freqs_cos.reshape(-1, dim_thw)
-        
-        dim_thw = freqs_sin.shape[-1]
-        freqs_sin = freqs_sin.reshape(temporal_size, h, w, dim_thw)
-        freqs_sin = torch.chunk(freqs_sin, get_sequence_parallel_world_size(), dim=split_dim - 1)[get_sequence_parallel_rank()]
-        freqs_sin = freqs_sin.reshape(-1, dim_thw)
-
-        from xfuser.core.long_ctx_attention import xFuserLongContextAttention
-        
-        for block in transformer.double_blocks + transformer.single_blocks:
-            block.hybrid_seq_parallel_attn = xFuserLongContextAttention()
-
-        # TeaCache logic
-        if self.enable_teacache:
-            inp = x.clone()
-            vec_ = guidance.clone()
-            txt_ = text_states.clone()
-            (
-                img_mod1_shift,
-                img_mod1_scale,
-                img_mod1_gate,
-                img_mod2_shift,
-                img_mod2_scale,
-                img_mod2_gate,
-            ) = self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
-            normed_inp = self.double_blocks[0].img_norm1(inp)
-            modulated_inp = modulate(
-                normed_inp, shift=img_mod1_shift, scale=img_mod1_scale
-            )
-
-            if self.cnt == 0 or self.cnt == self.num_steps-1:
-                should_calc = True
-                self.accumulated_rel_l1_distance = 0
-            else:
-                coefficients = [7.33226126e+02, -4.01131952e+02, 6.75869174e+01, -3.14987800e+00, 9.61237896e-02]
-                rescale_func = np.poly1d(coefficients)
-                self.accumulated_rel_l1_distance += rescale_func(((modulated_inp-self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()).cpu().item())
-                if self.accumulated_rel_l1_distance < self.rel_l1_thresh:
-                    should_calc = False
-                else:
-                    should_calc = True
-                    self.accumulated_rel_l1_distance = 0
-
-            self.previous_modulated_input = modulated_inp
-            self.cnt += 1
-            if self.cnt == self.num_steps:
-                self.cnt = 0
-
-            if not should_calc:
-                print("teacache: not should_calc", self.accumulated_rel_l1_distance, "step", t)
-                output = {"x": x + self.previous_residual}
-            else:
-                ori_x = x.clone()
-                output = original_forward(
-                    x,
-                    t,
-                    text_states,
-                    text_mask,
-                    text_states_2,
-                    freqs_cos,
-                    freqs_sin,
-                    guidance,
-                    return_dict,
-                )
-                self.previous_residual = output["x"] - ori_x
-        else:
-            output = original_forward(
-                x,
-                t,
-                text_states,
-                text_mask,
-                text_states_2,
-                freqs_cos,
-                freqs_sin,
-                guidance,
-                return_dict,
-            )
-
-        return_dict = not isinstance(output, tuple)
-        sample = output["x"]
-        sample = get_sp_group().all_gather(sample, dim=split_dim)
-        output["x"] = sample
-        return output
-
-    new_forward = new_forward.__get__(transformer)
-    transformer.forward = new_forward
-
 
 
 def teacache_forward(
@@ -178,7 +56,6 @@ def teacache_forward(
         guidance: torch.Tensor = None,  # Guidance for modulation, should be cfg_scale x 1000.
         return_dict: bool = True,
     ):
-        print("teacache_forward")
         out = {}
         img = x
         txt = text_states
@@ -262,7 +139,6 @@ def teacache_forward(
         
         if self.enable_teacache:
             if not should_calc:
-                print("teacache: not should_calc", self.accumulated_rel_l1_distance, "step", t)
                 img += self.previous_residual
             else:
                 ori_img = img.clone()
@@ -344,6 +220,72 @@ def teacache_forward(
             return out
         return img
 
+def parallelize_teacache_transformer(pipe):
+    transformer = pipe.transformer
+    original_forward = transformer.teacache_forward
+
+    @functools.wraps(transformer.__class__.forward)
+    def new_forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        text_states: torch.Tensor = None,
+        text_mask: torch.Tensor = None,
+        text_states_2: Optional[torch.Tensor] = None,
+        freqs_cos: Optional[torch.Tensor] = None,
+        freqs_sin: Optional[torch.Tensor] = None,
+        guidance: torch.Tensor = None,
+        return_dict: bool = True,
+    ):
+        if x.shape[-2] // 2 % get_sequence_parallel_world_size() == 0:
+            # try to split x by height
+            split_dim = -2
+        elif x.shape[-1] // 2 % get_sequence_parallel_world_size() == 0:
+            # try to split x by width
+            split_dim = -1
+        else:
+            raise ValueError(f"Cannot split video sequence into ulysses_degree x ring_degree ({get_sequence_parallel_world_size()}) parts evenly")
+
+        # patch sizes for the temporal, height, and width dimensions are 1, 2, and 2.
+        temporal_size, h, w = x.shape[2], x.shape[3] // 2, x.shape[4] // 2
+
+        x = torch.chunk(x, get_sequence_parallel_world_size(), dim=split_dim)[get_sequence_parallel_rank()]
+
+        dim_thw = freqs_cos.shape[-1]
+        freqs_cos = freqs_cos.reshape(temporal_size, h, w, dim_thw)
+        freqs_cos = torch.chunk(freqs_cos, get_sequence_parallel_world_size(), dim=split_dim - 1)[get_sequence_parallel_rank()]
+        freqs_cos = freqs_cos.reshape(-1, dim_thw)
+        
+        dim_thw = freqs_sin.shape[-1]
+        freqs_sin = freqs_sin.reshape(temporal_size, h, w, dim_thw)
+        freqs_sin = torch.chunk(freqs_sin, get_sequence_parallel_world_size(), dim=split_dim - 1)[get_sequence_parallel_rank()]
+        freqs_sin = freqs_sin.reshape(-1, dim_thw)
+
+        from xfuser.core.long_ctx_attention import xFuserLongContextAttention
+        
+        for block in transformer.double_blocks + transformer.single_blocks:
+            block.hybrid_seq_parallel_attn = xFuserLongContextAttention()
+
+        output = original_forward(
+            x,
+            t,
+            text_states,
+            text_mask,
+            text_states_2,
+            freqs_cos,
+            freqs_sin,
+            guidance,
+            return_dict,
+        )
+
+        return_dict = not isinstance(output, tuple)
+        sample = output["x"]
+        sample = get_sp_group().all_gather(sample, dim=split_dim)
+        output["x"] = sample
+        return output
+
+    new_forward = new_forward.__get__(transformer)
+    transformer.forward = new_forward
 
 def main():
     args = parse_args()
@@ -356,7 +298,7 @@ def main():
     save_path = args.save_path if args.save_path_suffix=="" else f'{args.save_path}_{args.save_path_suffix}'
     if not os.path.exists(args.save_path):
         os.makedirs(save_path, exist_ok=True)
-
+        
     # Load models
     hunyuan_video_sampler = HunyuanVideoSampler.from_pretrained(models_root_path, args=args)
     
@@ -372,11 +314,10 @@ def main():
     hunyuan_video_sampler.pipeline.transformer.__class__.accumulated_rel_l1_distance = 0
     hunyuan_video_sampler.pipeline.transformer.__class__.previous_modulated_input = None
     hunyuan_video_sampler.pipeline.transformer.__class__.previous_residual = None
-    
+    hunyuan_video_sampler.pipeline.transformer.__class__.forward = teacache_forward
+    hunyuan_video_sampler.pipeline.transformer.__class__.teacache_forward = teacache_forward
     if hunyuan_video_sampler.parallel_args['ulysses_degree'] > 1 or hunyuan_video_sampler.parallel_args['ring_degree'] > 1:
         parallelize_teacache_transformer(hunyuan_video_sampler.pipeline)
-    else:
-        hunyuan_video_sampler.pipeline.transformer.__class__.forward = teacache_forward
     
     # Start sampling
     # TODO: batch inference check
