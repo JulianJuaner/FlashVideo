@@ -31,35 +31,40 @@ export TOKENIZERS_PARALLELISM=false
 export NPROC_PER_NODE=8
 export ULYSSES_DEGREE=8
 export RING_DEGREE=1
+export NCCL_P2P_DISABLE=0
+# set NCCL timeout
+export NCCL_TIMEOUT=1800
 # add the current directory to the PYTHONPATH
 export PYTHONPATH=/dataset-vlm/yc/FinalProj/FlashVideo/HunyuanVideo:$PYTHONPATH
 
-# get a prompt list with various objects and styles.
-PROMPT_LIST=(
-    "A cat walks on the grass, realistic style."
-	"A man is playing the guitar, in a studio."
-	"A woman is painting a picture, in a studio."
-	"A dog is playing with a ball, in a park."
-	"A cat is sleeping on a sofa, in a living room."
-	"A man is reading a book, in a library."
-	"A woman is cooking in a kitchen."
-	"A dog is playing with a frisbee, in a park."
-	"A cat is playing with a mouse, in a house."
-	"A man is playing the piano, in a concert hall."
-)
-
+# prompts=(
+# 	"a woman in a red dress is dancing in a room",
+# 	"A cat is sleeping on a sofa, in a living room.",
+# 	"A cat walks on the grass, realistic style.",
+# 	"A man is reading a book, in a library.",
+# 	"A woman is cooking in a kitchen.",
+# 	"A man is playing the guitar, in a studio.",
+# 	"A woman is painting a picture, in a studio.",
+# 	"A dog is playing with a ball, in a park.",
+# 	"A cat is sleeping on a sofa, in a living room.",
+# 	"A dog is playing with a frisbee, in a park.",
+# 	"A cat is playing with a mouse, in a house.",
+# 	"A man is playing the piano, in a concert hall."
+# )
+# use list in bash
+prompts=("a woman in a red dress is dancing in a room" "A cat is sleeping on a sofa, in a living room." "A cat walks on the grass, realistic style." "A man is reading a book, in a library." "A woman is cooking in a kitchen." "A man is playing the guitar, in a studio." "A woman is painting a picture, in a studio." "A dog is playing with a ball, in a park." "A cat is sleeping on a sofa, in a living room." "A dog is playing with a frisbee, in a park." "A cat is playing with a mouse, in a house." "A man is playing the piano, in a concert hall.")
 # loop over the prompt list.
-for PROMPT in "${PROMPT_LIST[@]}"; do
-    torchrun --nproc_per_node=$NPROC_PER_NODE /dataset-vlm/yc/FinalProj/FlashVideo/teacache_apply/teacache_sample_video.py \
-        --video-size 720 1280 \
-        --video-length 129 \
-        --infer-steps 50 \
-        --prompt "$PROMPT" \
-        --seed 0 \
-        --embedded-cfg-scale 6.0 \
-        --flow-shift 7.0 \
-        --flow-reverse \
-        --ulysses-degree=$ULYSSES_DEGREE \
-        --ring-degree=$RING_DEGREE \
-        --save-path ./results_tea_multigpu
+for prompt in "${prompts[@]}"; do
+	torchrun --nproc_per_node=$NPROC_PER_NODE /dataset-vlm/yc/FinalProj/FlashVideo/teacache_apply/teacache_sample_video.py \
+		--video-size 720 1280 \
+		--video-length 129 \
+		--infer-steps 50 \
+		--prompt "$prompt" \
+		--seed 0 \
+		--embedded-cfg-scale 6.0 \
+		--flow-shift 7.0 \
+		--flow-reverse \
+		--ulysses-degree=$ULYSSES_DEGREE \
+		--ring-degree=$RING_DEGREE \
+		--save-path ./results_tea_multigpu
 done

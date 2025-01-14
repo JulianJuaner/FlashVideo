@@ -1,4 +1,3 @@
-
 import torch
 import json
 import numpy as np
@@ -126,19 +125,43 @@ def teacache_forward(
             else: 
                 coefficients = [7.33226126e+02, -4.01131952e+02,  6.75869174e+01, -3.14987800e+00, 9.61237896e-02]
                 rescale_func = np.poly1d(coefficients)
-                self.accumulated_rel_l1_distance += rescale_func(((modulated_inp-self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()).cpu().item())
+                local_rel_l1 = rescale_func(((modulated_inp-self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()).cpu().item())
+                
+                # 同步所有GPU的rel_l1值
+                if dist.is_initialized():
+                    world_size = dist.get_world_size()
+                    rel_l1_tensor = torch.tensor([local_rel_l1], device=modulated_inp.device)
+                    dist.all_reduce(rel_l1_tensor, op=dist.ReduceOp.SUM)
+                    avg_rel_l1 = rel_l1_tensor.item() / world_size
+                    self.accumulated_rel_l1_distance += avg_rel_l1
+                else:
+                    self.accumulated_rel_l1_distance += local_rel_l1
+                    
                 if self.accumulated_rel_l1_distance < self.rel_l1_thresh:
                     should_calc = False
                 else:
                     should_calc = True
                     self.accumulated_rel_l1_distance = 0
+                    
+            # 确保所有GPU的should_calc一致
+            if dist.is_initialized():
+                should_calc_tensor = torch.tensor([1 if should_calc else 0], device=modulated_inp.device)
+                dist.all_reduce(should_calc_tensor, op=dist.ReduceOp.MAX)
+                should_calc = bool(should_calc_tensor.item())
+                
             self.previous_modulated_input = modulated_inp  
             self.cnt += 1
             if self.cnt == self.num_steps:
-                self.cnt = 0          
+                self.cnt = 0
         
         if self.enable_teacache:
+            if dist.is_initialized():
+                rank = dist.get_rank()
+                logger.debug(f"Rank {rank} entering teacache_forward, step {self.cnt}, {should_calc}")
             if not should_calc:
+                # print("teacache_forward: skip residual")
+                if dist.is_initialized():
+                    rank = dist.get_rank()
                 img += self.previous_residual
             else:
                 ori_img = img.clone()
@@ -304,47 +327,55 @@ def main():
     
     # Get the updated args
     args = hunyuan_video_sampler.args
-
-    
-    # TeaCache
-    hunyuan_video_sampler.pipeline.transformer.__class__.enable_teacache = True
-    hunyuan_video_sampler.pipeline.transformer.__class__.cnt = 0
-    hunyuan_video_sampler.pipeline.transformer.__class__.num_steps = args.infer_steps
-    hunyuan_video_sampler.pipeline.transformer.__class__.rel_l1_thresh = 0.15 # 0.1 for 1.6x speedup, 0.15 for 2.1x speedup
-    hunyuan_video_sampler.pipeline.transformer.__class__.accumulated_rel_l1_distance = 0
-    hunyuan_video_sampler.pipeline.transformer.__class__.previous_modulated_input = None
-    hunyuan_video_sampler.pipeline.transformer.__class__.previous_residual = None
     hunyuan_video_sampler.pipeline.transformer.__class__.forward = teacache_forward
     hunyuan_video_sampler.pipeline.transformer.__class__.teacache_forward = teacache_forward
     if hunyuan_video_sampler.parallel_args['ulysses_degree'] > 1 or hunyuan_video_sampler.parallel_args['ring_degree'] > 1:
         parallelize_teacache_transformer(hunyuan_video_sampler.pipeline)
-    
-    # Start sampling
-    # TODO: batch inference check
-    outputs = hunyuan_video_sampler.predict(
-        prompt=args.prompt, 
-        height=args.video_size[0],
-        width=args.video_size[1],
-        video_length=args.video_length,
-        seed=args.seed,
-        negative_prompt=args.neg_prompt,
-        infer_steps=args.infer_steps,
-        guidance_scale=args.cfg_scale,
-        num_videos_per_prompt=args.num_videos,
-        flow_shift=args.flow_shift,
-        batch_size=args.batch_size,
-        embedded_guidance_scale=args.embedded_cfg_scale
-    )
-    samples = outputs['samples']
-    
-    # Save samples
-    if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
-        for i, sample in enumerate(samples):
-            sample = samples[i].unsqueeze(0)
-            time_flag = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%H:%M:%S")
-            save_path = f"{save_path}/{time_flag}_seed{outputs['seeds'][i]}_{outputs['prompts'][i][:100].replace('/','')}.mp4"
-            save_videos_grid(sample, save_path, fps=24)
-            logger.info(f'Sample save to: {save_path}')
+        
+    prompts = []
+    # read from file.
+    if args.prompt.endswith('.txt'):
+        with open(args.prompt, 'r') as f:
+            prompts = f.readlines()
+    else:
+        prompts = [args.prompt]
+        
+    for prompt in prompts:
+        # TeaCache
+        hunyuan_video_sampler.pipeline.transformer.__class__.enable_teacache = True
+        hunyuan_video_sampler.pipeline.transformer.__class__.cnt = 0
+        hunyuan_video_sampler.pipeline.transformer.__class__.num_steps = args.infer_steps
+        hunyuan_video_sampler.pipeline.transformer.__class__.rel_l1_thresh = 0.15 # 0.1 for 1.6x speedup, 0.15 for 2.1x speedup
+        hunyuan_video_sampler.pipeline.transformer.__class__.accumulated_rel_l1_distance = 0
+        hunyuan_video_sampler.pipeline.transformer.__class__.previous_modulated_input = None
+        hunyuan_video_sampler.pipeline.transformer.__class__.previous_residual = None
+        
+        # Start sampling
+        # TODO: batch inference check
+        outputs = hunyuan_video_sampler.predict(
+            prompt=prompt, 
+            height=args.video_size[0],
+            width=args.video_size[1],
+            video_length=args.video_length,
+            seed=args.seed,
+            negative_prompt=args.neg_prompt,
+            infer_steps=args.infer_steps,
+            guidance_scale=args.cfg_scale,
+            num_videos_per_prompt=args.num_videos,
+            flow_shift=args.flow_shift,
+            batch_size=args.batch_size,
+            embedded_guidance_scale=args.embedded_cfg_scale
+        )
+        samples = outputs['samples']
+        
+        # Save samples
+        if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
+            for i, sample in enumerate(samples):
+                sample = samples[i].unsqueeze(0)
+                time_flag = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%H:%M:%S")
+                save_path = f"{save_path}/{time_flag}_seed{outputs['seeds'][i]}_{outputs['prompts'][i][:100].replace('/','')}.mp4"
+                save_videos_grid(sample, save_path, fps=24)
+                logger.info(f'Sample save to: {save_path}')
 
 if __name__ == "__main__":
     main()
