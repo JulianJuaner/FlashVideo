@@ -66,7 +66,7 @@ for prompt in "${prompts[@]}"; do
 		--flow-reverse \
 		--ulysses-degree=$ULYSSES_DEGREE \
 		--ring-degree=$RING_DEGREE \
-		--save-path ./results_tea_multigpu
+		--save-path /dataset-vlm/yc/FinalProj/FlashVideo/results/results_tea_multigpu
 done
 
 # Exp Record.

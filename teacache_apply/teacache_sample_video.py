@@ -343,44 +343,23 @@ def main():
         hunyuan_video_sampler.pipeline.transformer.__class__.previous_residual = None
         
         # Start sampling
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-            schedule=torch.profiler.schedule(
-                wait=1,
-                warmup=1,
-                active=3,
-            ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(f"{save_path}/profiler"),
-            record_shapes=True,
-            profile_memory=True,
-            with_flops=True,
-            with_modules=True
-        ) as prof:
-            outputs = hunyuan_video_sampler.predict(
-                prompt=prompt,
-                height=args.video_size[0],
-                width=args.video_size[1],
-                video_length=args.video_length,
-                seed=args.seed,
-                negative_prompt=args.neg_prompt,
-                infer_steps=3,
-                guidance_scale=args.cfg_scale,
-                num_videos_per_prompt=args.num_videos,
-                flow_shift=args.flow_shift,
-                batch_size=args.batch_size,
-                embedded_guidance_scale=args.embedded_cfg_scale
-            )
-            prof.step()
+        outputs = hunyuan_video_sampler.predict(
+            prompt=prompt,
+            height=args.video_size[0],
+            width=args.video_size[1],
+            video_length=args.video_length,
+            seed=args.seed,
+            negative_prompt=args.neg_prompt,
+            infer_steps=args.infer_steps,
+            guidance_scale=args.cfg_scale,
+            num_videos_per_prompt=args.num_videos,
+            flow_shift=args.flow_shift,
+            batch_size=args.batch_size,
+            embedded_guidance_scale=args.embedded_cfg_scale
+        )
+
 
         # Print profiler results
-        logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
-        
-        # Save detailed profiler results
-        prof.export_chrome_trace(f"{save_path}/trace.json")
-
         # Save samples
         if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
             for i, sample in enumerate(outputs['samples']):
