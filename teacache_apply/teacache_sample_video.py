@@ -14,12 +14,9 @@ from hyvideo.config import parse_args
 from hyvideo.inference import HunyuanVideoSampler
 from hyvideo.modules.modulate_layers import modulate
 from hyvideo.modules.attenion import attention, parallel_attention, get_cu_seqlens
-from typing import Any, List, Tuple, Optional, Union, Dict
 
-from typing import List, Optional, Tuple, Union
+from typing import Optional
 
-from pathlib import Path
-from loguru import logger
 
 import torch
 import torch.distributed as dist
@@ -30,18 +27,14 @@ try:
         get_sequence_parallel_world_size,
         get_sequence_parallel_rank,
         get_sp_group,
-        initialize_model_parallel,
-        init_distributed_environment
     )
 except:
     xfuser = None
     get_sequence_parallel_world_size = None
     get_sequence_parallel_rank = None
     get_sp_group = None
-    initialize_model_parallel = None
-    init_distributed_environment = None
 
-
+import torch.profiler
 
 def teacache_forward(
         self,
@@ -155,11 +148,10 @@ def teacache_forward(
                 self.cnt = 0
         
         if self.enable_teacache:
-            if dist.is_initialized():
-                rank = dist.get_rank()
-                logger.debug(f"Rank {rank} entering teacache_forward, step {self.cnt}, {should_calc}")
+            # if dist.is_initialized():
+            #     rank = dist.get_rank()
+            #     logger.debug(f"Rank {rank} entering teacache_forward, step {self.cnt}, {should_calc}")
             if not should_calc:
-                # print("teacache_forward: skip residual")
                 if dist.is_initialized():
                     rank = dist.get_rank()
                 img += self.previous_residual
@@ -351,27 +343,48 @@ def main():
         hunyuan_video_sampler.pipeline.transformer.__class__.previous_residual = None
         
         # Start sampling
-        # TODO: batch inference check
-        outputs = hunyuan_video_sampler.predict(
-            prompt=prompt, 
-            height=args.video_size[0],
-            width=args.video_size[1],
-            video_length=args.video_length,
-            seed=args.seed,
-            negative_prompt=args.neg_prompt,
-            infer_steps=args.infer_steps,
-            guidance_scale=args.cfg_scale,
-            num_videos_per_prompt=args.num_videos,
-            flow_shift=args.flow_shift,
-            batch_size=args.batch_size,
-            embedded_guidance_scale=args.embedded_cfg_scale
-        )
-        samples = outputs['samples']
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(
+                wait=1,
+                warmup=1,
+                active=3,
+            ),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(f"{save_path}/profiler"),
+            record_shapes=True,
+            profile_memory=True,
+            with_flops=True,
+            with_modules=True
+        ) as prof:
+            outputs = hunyuan_video_sampler.predict(
+                prompt=prompt,
+                height=args.video_size[0],
+                width=args.video_size[1],
+                video_length=args.video_length,
+                seed=args.seed,
+                negative_prompt=args.neg_prompt,
+                infer_steps=3,
+                guidance_scale=args.cfg_scale,
+                num_videos_per_prompt=args.num_videos,
+                flow_shift=args.flow_shift,
+                batch_size=args.batch_size,
+                embedded_guidance_scale=args.embedded_cfg_scale
+            )
+            prof.step()
+
+        # Print profiler results
+        logger.info(prof.key_averages().table(sort_by="cuda_time_total", row_limit=20))
         
+        # Save detailed profiler results
+        prof.export_chrome_trace(f"{save_path}/trace.json")
+
         # Save samples
         if 'LOCAL_RANK' not in os.environ or int(os.environ['LOCAL_RANK']) == 0:
-            for i, sample in enumerate(samples):
-                sample = samples[i].unsqueeze(0)
+            for i, sample in enumerate(outputs['samples']):
+                sample = sample.unsqueeze(0)
                 time_flag = datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d-%H:%M:%S")
                 save_path = f"{save_path}/{time_flag}_seed{outputs['seeds'][i]}_{outputs['prompts'][i][:100].replace('/','')}.mp4"
                 save_videos_grid(sample, save_path, fps=24)

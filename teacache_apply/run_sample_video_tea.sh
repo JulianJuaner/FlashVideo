@@ -28,8 +28,8 @@
 
 export TOKENIZERS_PARALLELISM=false
 
-export NPROC_PER_NODE=8
-export ULYSSES_DEGREE=8
+export NPROC_PER_NODE=1
+export ULYSSES_DEGREE=1
 export RING_DEGREE=1
 export NCCL_P2P_DISABLE=0
 # set NCCL timeout
@@ -52,10 +52,10 @@ export PYTHONPATH=/dataset-vlm/yc/FinalProj/FlashVideo/HunyuanVideo:$PYTHONPATH
 # 	"A man is playing the piano, in a concert hall."
 # )
 # use list in bash
-prompts=("a woman in a red dress is dancing in a room" "A cat is sleeping on a sofa, in a living room." "A cat walks on the grass, realistic style." "A man is reading a book, in a library." "A woman is cooking in a kitchen." "A man is playing the guitar, in a studio." "A woman is painting a picture, in a studio." "A dog is playing with a ball, in a park." "A cat is sleeping on a sofa, in a living room." "A dog is playing with a frisbee, in a park." "A cat is playing with a mouse, in a house." "A man is playing the piano, in a concert hall.")
+prompts=("a woman in a red dress is dancing in a room")
 # loop over the prompt list.
 for prompt in "${prompts[@]}"; do
-	torchrun --nproc_per_node=$NPROC_PER_NODE /dataset-vlm/yc/FinalProj/FlashVideo/teacache_apply/teacache_sample_video.py \
+	python /dataset-vlm/yc/FinalProj/FlashVideo/teacache_apply/teacache_sample_video.py \
 		--video-size 720 1280 \
 		--video-length 129 \
 		--infer-steps 50 \
@@ -63,12 +63,9 @@ for prompt in "${prompts[@]}"; do
 		--seed 0 \
 		--embedded-cfg-scale 6.0 \
 		--flow-shift 7.0 \
-		--flow-reverse \
+    	--flow-reverse \
+    	--use-cpu-offload \
 		--ulysses-degree=$ULYSSES_DEGREE \
 		--ring-degree=$RING_DEGREE \
-		--save-path ./results_tea_multigpu
+		--save-path /dataset-vlm/yc/FinalProj/FlashVideo/results/results_tea_single
 done
-
-# Exp Record.
-# on node 31: 8-GPU inference: 398s
-# on node 31: 1-GPU inference: 1390s
