@@ -132,8 +132,8 @@ def forward_double(
         
     if TIMESTEP % 1 == 0:
         # save the qk
-        torch.save(q.detach().cpu(), f"{SAVE_PATH}/q_double_{LAYER_CUR}_{TIMESTEP}.pt")
-        torch.save(k.detach().cpu(), f"{SAVE_PATH}/k_double_{LAYER_CUR}_{TIMESTEP}.pt")
+        torch.save(q.detach(), f"{SAVE_PATH}/q_double_{LAYER_CUR}_{TIMESTEP}.pt")
+        torch.save(k.detach(), f"{SAVE_PATH}/k_double_{LAYER_CUR}_{TIMESTEP}.pt")
     
     # attention computation start
     if not self.hybrid_seq_parallel_attn:
@@ -236,8 +236,8 @@ def forward_single(
         LAYER_CUR += 1
     if TIMESTEP % 1 == 0:
         # save the qk
-        torch.save(q.detach().cpu(), f"{SAVE_PATH}/q_single_{LAYER_CUR}_{TIMESTEP}.pt")
-        torch.save(k.detach().cpu(), f"{SAVE_PATH}/k_single_{LAYER_CUR}_{TIMESTEP}.pt")
+        torch.save(q.detach(), f"{SAVE_PATH}/q_single_{LAYER_CUR}_{TIMESTEP}.pt")
+        torch.save(k.detach(), f"{SAVE_PATH}/k_single_{LAYER_CUR}_{TIMESTEP}.pt")
     
     # attention computation start
     if not self.hybrid_seq_parallel_attn:

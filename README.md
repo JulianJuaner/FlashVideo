@@ -2,7 +2,7 @@
 
 ## Overview Log
 ### Multi-GPU Teacache Inference
-This can achieve a nearly 1.5X inference speed-up conparing with vanilla 8-GPU inference (450 -> 298s)
+This can achieve a nearly 1.9X inference speed-up conparing with vanilla 8-GPU inference (483 -> 256s)
 ```bash
 cd HunyuanVideo
 bash ../teacache_apply/run_sample_video_multigpu_tea.sh

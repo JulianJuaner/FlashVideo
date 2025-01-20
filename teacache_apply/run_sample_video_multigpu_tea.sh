@@ -36,7 +36,7 @@ export NCCL_P2P_DISABLE=0
 export NCCL_TIMEOUT=1800
 # add the current directory to the PYTHONPATH
 export PYTHONPATH=/dataset-vlm/yc/FinalProj/FlashVideo/HunyuanVideo:$PYTHONPATH
-
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 # prompts=(
 # 	"a woman in a red dress is dancing in a room",
 # 	"A cat is sleeping on a sofa, in a living room.",
@@ -70,5 +70,9 @@ for prompt in "${prompts[@]}"; do
 done
 
 # Exp Record.
-# on node 31: 8-GPU inference: 398s
-# on node 31: 1-GPU inference: 1390s
+# on node 29: 8-GPU normal inference: 483s
+# on node 29: 4-GPU tea inference: 418s
+# on node 29: 8-GPU tea inference: 256s
+
+# on node 31: 8-GPU tea inference: 398s
+# on node 31: 1-GPU tea inference: 1390s
