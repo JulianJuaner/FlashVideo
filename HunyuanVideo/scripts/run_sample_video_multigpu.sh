@@ -33,7 +33,7 @@ export ULYSSES_DEGREE=4
 export RING_DEGREE=1
 
 torchrun --nproc_per_node=$NPROC_PER_NODE sample_video.py \
-	--video-size 320 480 \
+	--video-size 720 1280 \
 	--video-length 129 \
 	--infer-steps 50 \
 	--prompt "A cat walks on the grass, realistic style." \

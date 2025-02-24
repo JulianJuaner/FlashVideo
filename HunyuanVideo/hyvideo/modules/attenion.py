@@ -98,6 +98,8 @@ def attention(
     k = pre_attn_layout(k)
     v = pre_attn_layout(v)
 
+    print(f"q.shape: {q.shape}, k.shape: {k.shape}, v.shape: {v.shape}")
+
     if mode == "torch":
         if attn_mask is not None and attn_mask.dtype != torch.bool:
             attn_mask = attn_mask.to(q.dtype)
