@@ -1,5 +1,5 @@
-import importlib.metadata
 import math
+import time
 
 import torch
 import torch.nn as nn
@@ -14,10 +14,13 @@ except ImportError:
     flash_attn_varlen_func = None
     _flash_attn_forward = None
 
-from .attenion import MEMORY_LAYOUT, get_cu_seqlens
-
 # FLEX-ATTENTION ESSENTIALS.
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import (
+    create_block_mask, 
+    flex_attention, 
+    _convert_mask_to_block_mask, 
+    _create_sparse_block_from_block_mask
+)
 create_block_mask = torch.compile(create_block_mask)
 from diffusers.models.attention_processor import Attention
 from typing import Optional
@@ -28,6 +31,14 @@ attn_outputs = []
 BLOCK_MASK = None
 HEIGHT = None
 WIDTH = None
+
+MEMORY_LAYOUT_BLOCK = {
+    "flex": (
+        lambda x: x.transpose(1, 2),
+        lambda x: x.transpose(1, 2),
+    ),
+}
+
 
 @lru_cache
 def init_local_mask_flex(height, width, text_length, window_size, device):
@@ -47,6 +58,40 @@ def init_local_mask_flex(height, width, text_length, window_size, device):
     HEIGHT = height
     WIDTH = width
 
+def tensor_to_block_mask(mask_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE):
+    start_time = time.time()
+    # just use a full mask for now
+    # full_mask = torch.ones_like(mask_tensor, dtype=torch.bool)
+    # TODO: merge the mask_mod function with the models_mul.py's repeat_interleave mode.
+    BLOCK_SIZE_PER = 128
+    # print("original mask percentage: ", mask_tensor.sum()/mask_tensor.numel())
+    def mask_mod(b, h, q_idx, kv_idx):
+        # print(q_idx, kv_idx)
+        # 1. txt tokens can attend to all image tokens and text tokens
+        kv_mask_idx = kv_idx // BLOCK_SIZE_PER
+        return torch.logical_or(
+            q_idx >= 880*BLOCK_SIZE_PER,
+            torch.logical_or(
+                kv_idx >= 880*BLOCK_SIZE_PER,
+                mask_tensor[q_idx, kv_mask_idx]==True,
+            )
+        )
+        # # 2. image tokens: return quantized mask
+        # q_mask_idx = q_idx // BLOCK_SIZE_PER
+        # kv_mask_idx = kv_idx // BLOCK_SIZE_PER
+        # return mask_tensor[q_mask_idx, kv_mask_idx]
+    
+    print("mask_tensor shape: ", mask_tensor.shape, mask_tensor.device)
+    print("mask_tensor shape: ", mask_tensor.shape, mask_tensor.device)
+    block_mask = create_block_mask(mask_mod, B=None, H=None, device=mask_tensor.device,
+                                   Q_LEN=Q_LEN, 
+                                   KV_LEN=KV_LEN,
+                                   # BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
+                                   _compile=True)
+    end_time = time.time()
+    print(f"tensor_to_block_mask time: {end_time - start_time} seconds")
+    return block_mask
+
 def block_flex_attention(
     q,
     k,
@@ -54,27 +99,37 @@ def block_flex_attention(
     mode="flex",
     drop_rate=0,
     attn_mask=None,
+    block_mask=None,
     causal=False,
     proportional_attention=True,
+    KV_BLOCK_SIZE=128,
+    Q_BLOCK_SIZE=128,
     cu_seqlens_q=None,
     cu_seqlens_kv=None,
     max_seqlen_q=None,
     max_seqlen_kv=None,
     batch_size=1,
 ):
-    pre_attn_layout, post_attn_layout = MEMORY_LAYOUT[mode]
+    pre_attn_layout, post_attn_layout = MEMORY_LAYOUT_BLOCK[mode]
     q = pre_attn_layout(q)
     k = pre_attn_layout(k)
     v = pre_attn_layout(v)
 
     if mode == "flex":
-        if attn_mask is not None and attn_mask.dtype != torch.bool:
-            attn_func = partial(flex_attention, block_mask=attn_mask)
+        if attn_mask is not None:
+            if attn_mask.dtype != torch.bool:
+                attn_mask = attn_mask.to(q.dtype)
+            print("attn_mask shape: ", attn_mask.shape)
+            print("qkv shape: ", q.shape, k.shape, v.shape)
+            block_mask = tensor_to_block_mask(attn_mask, Q_LEN=q.size(2), KV_LEN=k.size(2), Q_BLOCK_SIZE=Q_BLOCK_SIZE, KV_BLOCK_SIZE=KV_BLOCK_SIZE)
+            attn_func = partial(flex_attention, block_mask=block_mask)
             attn_func = torch.compile(attn_func, dynamic=False)
+            print(block_mask)
+            print("block_mask shape: ", block_mask.shape)
 
-        train_seq_len = q.size(1)
-        head_dim = q.size(3)
-        print("qkv shape: ", q.shape, k.shape, v.shape)
+        train_seq_len = q.size(2)
+        head_dim = q.size(1)
+        print("qkv shape after transpose: ", q.shape, k.shape, v.shape)
         if proportional_attention:
             attention_scale = math.sqrt(math.log(10 * k.size(2), train_seq_len) / head_dim)
         else:
