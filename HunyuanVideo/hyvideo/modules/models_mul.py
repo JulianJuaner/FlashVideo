@@ -4,6 +4,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -16,221 +17,9 @@ from .posemb_layers import apply_rotary_emb
 from .mlp_layers import MLP, MLPEmbedder, FinalLayer
 from .modulate_layers import ModulateDiT, modulate, apply_gate
 from .token_refiner import SingleTokenRefiner
+from .tensor_ops import reshape_to_blocks, reshape_from_blocks
+from .attenion_block_flex import block_flex_attention
 
-
-# FLEX-ATTENTION ESSENTIALS.
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-create_block_mask = torch.compile(create_block_mask)
-from diffusers.models.attention_processor import Attention
-from typing import Optional
-from functools import partial, lru_cache
-# from diffusers.models.embeddings import apply_rotary_emb
-
-
-attn_outputs_teacher = []
-attn_outputs = []
-BLOCK_MASK = None
-HEIGHT = None
-WIDTH = None
-
-def reshape_to_blocks(x, h, w, t, block_size):
-    """Reshape tensor into blocks for hierarchical attention.
-    
-    Args:
-        x: Input tensor of shape [B, (t h w), H, D]
-        h, w, t: Original dimensions
-        block_size: List of [block_h, block_w, block_t]
-    
-    Returns:
-        Tensor of shape [B, (bt bh bw), (t_local h_local w_local), H, D]
-        and a dict containing metadata for reshape back
-    """
-    B, L, num_heads, D = x.shape
-    blocks_h = h // block_size[0]
-    blocks_w = w // block_size[1] 
-    blocks_t = t // block_size[2]
-    
-    # Store metadata for reshaping back
-    metadata = {
-        'original_shape': x.shape,
-        'h': h, 'w': w, 't': t,
-        'blocks_h': blocks_h, 
-        'blocks_w': blocks_w,
-        'blocks_t': blocks_t,
-        'block_size': block_size
-    }
-    
-    # First reshape to [B, t, h, w, H, D]
-    x = x.view(B, t, h, w, num_heads, D)
-    
-    # Reshape spatial dimensions into blocks
-    x = x.view(B, blocks_t, block_size[2],  # time
-                  blocks_h, block_size[0],   # height
-                  blocks_w, block_size[1],   # width
-                  num_heads, D)
-    
-    # Permute and reshape to get blocks
-    x = x.permute(0, 1, 3, 5,                    # B, bt, bh, bw
-                     2, 4, 6,                     # t_local, h_local, w_local
-                     7, 8)                        # H, D
-    
-    num_blocks = blocks_t * blocks_h * blocks_w
-    tokens_per_block = block_size[0] * block_size[1] * block_size[2]
-    
-    x_blocks = x.reshape(B, num_blocks, tokens_per_block, num_heads, D)
-    
-    return x_blocks, metadata
-
-def reshape_from_blocks(x_blocks, metadata):
-    """Reshape blocked tensor back to original shape.
-    
-    Args:
-        x_blocks: Tensor of shape [B, (bt bh bw), (t_local h_local w_local), H, D]
-        metadata: Dict containing reshape metadata
-    
-    Returns:
-        Tensor of original shape [B, (t h w), H, D]
-    """
-    B, num_blocks, tokens_per_block, num_heads, D = x_blocks.shape
-    block_size = metadata['block_size']
-    h, w, t = metadata['h'], metadata['w'], metadata['t']
-    blocks_h = metadata['blocks_h']
-    blocks_w = metadata['blocks_w']
-    blocks_t = metadata['blocks_t']
-    
-    # Reshape to blocked format
-    x = x_blocks.view(B, blocks_t, blocks_h, blocks_w,  # B, bt, bh, bw
-                        block_size[2],                   # t_local
-                        block_size[0],                   # h_local
-                        block_size[1],                   # w_local
-                        num_heads, D)
-    
-    # Permute back to original order
-    x = x.permute(0, 1, 4, 2, 5, 3, 6, 7, 8)
-    
-    # Reshape back to original spatial dimensions
-    x = x.reshape(B, t, h, w, num_heads, D)
-    
-    # Final reshape to original shape
-    x = x.view(B, t * h * w, num_heads, D)
-    
-    return x
-
-@lru_cache
-def init_local_mask_flex(height, width, text_length, window_size, device):
-    
-    def local_mask(b, h, q_idx, kv_idx):
-        q_y = (q_idx - text_length) // width
-        q_x = (q_idx - text_length) % width
-        kv_y = (kv_idx - text_length) // width
-        kv_x = (kv_idx - text_length) % width
-        return torch.logical_or(torch.logical_or(q_idx < text_length, kv_idx < text_length),
-                                (q_y - kv_y) ** 2 + (q_x - kv_x) ** 2 < window_size ** 2)
-    
-    global BLOCK_MASK, HEIGHT, WIDTH
-    BLOCK_MASK = create_block_mask(local_mask, B=None, H=None, device=device,
-                                   Q_LEN=text_length + height * width, 
-                                   KV_LEN=text_length + height * width, _compile=True)
-    HEIGHT = height
-    WIDTH = width
-
-class LocalFlexAttnProcessor:
-    """the"""
-
-    def __init__(self, distill=False):
-        super().__init__()
-        self.flex_attn = partial(flex_attention, block_mask=BLOCK_MASK)
-        self.flex_attn = torch.compile(self.flex_attn, dynamic=False)
-        self.distill = distill
-
-    def __call__(
-        self,
-        attn: Attention,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
-        proportional_attention=False
-    ) -> torch.FloatTensor:
-        batch_size, _, _ = hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
-
-        # `sample` projections.
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
-
-        inner_dim = key.shape[-1]
-        head_dim = inner_dim // attn.heads
-
-        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
-        if attn.norm_q is not None:
-            query = attn.norm_q(query)
-        if attn.norm_k is not None:
-            key = attn.norm_k(key)
-
-        # the attention in FluxSingleTransformerBlock does not use `encoder_hidden_states`
-        if encoder_hidden_states is not None:
-            # `context` projections.
-            encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
-            encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
-            encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
-
-            encoder_hidden_states_query_proj = encoder_hidden_states_query_proj.view(
-                batch_size, -1, attn.heads, head_dim
-            ).transpose(1, 2)
-            encoder_hidden_states_key_proj = encoder_hidden_states_key_proj.view(
-                batch_size, -1, attn.heads, head_dim
-            ).transpose(1, 2)
-            encoder_hidden_states_value_proj = encoder_hidden_states_value_proj.view(
-                batch_size, -1, attn.heads, head_dim
-            ).transpose(1, 2)
-
-            if attn.norm_added_q is not None:
-                encoder_hidden_states_query_proj = attn.norm_added_q(encoder_hidden_states_query_proj)
-            if attn.norm_added_k is not None:
-                encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
-
-            # attention
-            query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)
-            key = torch.cat([encoder_hidden_states_key_proj, key], dim=2)
-            value = torch.cat([encoder_hidden_states_value_proj, value], dim=2)
-
-        if image_rotary_emb is not None:
-            query = apply_rotary_emb(query, image_rotary_emb)
-            key = apply_rotary_emb(key, image_rotary_emb)
-
-        train_seq_len = 64 ** 2 + 512
-        if proportional_attention:
-            attention_scale = math.sqrt(math.log(key.size(2), train_seq_len) / head_dim)
-        else:
-            attention_scale = math.sqrt(1 / head_dim)
-
-        hidden_states = self.flex_attn(query, key, value, scale=attention_scale)
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
-        hidden_states = hidden_states.to(query.dtype)
-
-        if encoder_hidden_states is not None:
-            encoder_hidden_states, hidden_states = (
-                hidden_states[:, : encoder_hidden_states.shape[1]],
-                hidden_states[:, encoder_hidden_states.shape[1] :],
-            )
-
-            # linear proj
-            hidden_states = attn.to_out[0](hidden_states)
-            # dropout
-            hidden_states = attn.to_out[1](hidden_states)
-            encoder_hidden_states = attn.to_add_out(encoder_hidden_states)
-            if self.distill:
-                attn_outputs.append(hidden_states)
-
-            return hidden_states, encoder_hidden_states
-        else:
-            if self.distill:
-                attn_outputs.append(hidden_states)
-            return hidden_states
 
 class MMDoubleStreamBlock(nn.Module):
     """
@@ -356,7 +145,7 @@ class MMDoubleStreamBlock(nn.Module):
         first_level_block_size: list = [5, 5, 3],
         second_level_block_size: list = [4, 4, 4],
         hwt: list = [45, 80, 33], # four GPUs
-        ULYSSES_DEGREE: int = 4,
+        ULYSSES_DEGREE: int = 1,
         RING_DEGREE: int = 1,
         attn_threshold: float = 0.2,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -410,63 +199,57 @@ class MMDoubleStreamBlock(nn.Module):
         # Apply QK-Norm if needed.
         txt_q = self.txt_attn_q_norm(txt_q).to(txt_v)
         txt_k = self.txt_attn_k_norm(txt_k).to(txt_v)
-
+        # -------------------------------------------------------------------------------------
         # first level attention
+        t0 = time.time()
         q = torch.cat((img_q, txt_q), dim=1)
         # rearrange 
         h, w, t = hwt[0], hwt[1], hwt[2]
         w = w // ULYSSES_DEGREE # for multi-GPU
 
         # Reshape k into blocks
+        t1 = time.time()
         blocks_h, blocks_w, blocks_t = h // first_level_block_size[0], w // first_level_block_size[1], t // first_level_block_size[2]
-        num_blocks = blocks_h * blocks_w * blocks_t
+        
+        # Reshape img_k into blocks
+        img_k_blocks, metadata = reshape_to_blocks(img_k, h, w, t, first_level_block_size)
+        
+        # Calculate block-wise attention scores
+        t2 = time.time()
+        # Average within each block to get block representation
+        block_centers = img_k_blocks.mean(dim=2)  # [B, num_blocks, H, D]
+        
+        # Calculate attention scores
+        t3 = time.time()
+        attn_scores = torch.matmul(q.transpose(1, 2), block_centers.transpose(1, 2).transpose(-2, -1))  # [B, L, H, num_blocks]
+        attn_scores = attn_scores.mean(dim=1)  # [B, L, num_blocks] - average over heads (H)
 
-        # Reshape img_k into blocks first
-        img_k_blocks = rearrange(img_k, 
-            "B (t h w) H D -> B (bt bh bw) (t_local h_local w_local) H D", 
-            bt=blocks_t, bh=blocks_h, bw=blocks_w,
-            t_local=first_level_block_size[2], 
-            h_local=first_level_block_size[1], 
-            w_local=first_level_block_size[0])
+        # Create attention mask and select top blocks
+        t4 = time.time()
+        
+        # First create mask at block level (B, L, num_blocks)
+        # use the percentage of the top 10% blocks
+        percentage = 0.3
+        block_mask = (attn_scores > torch.topk(attn_scores, k=int(percentage * attn_scores.shape[-1])).values)
+        
+        # Expand block mask to token level
+        tokens_per_block = first_level_block_size[0] * first_level_block_size[1] * first_level_block_size[2]
+        attn_mask = block_mask.repeat_interleave(tokens_per_block, dim=-1)
 
-        # Calculate attention scores between q and block centers
-        block_centers = img_k_blocks.mean(dim=2)  # Average over tokens within each block
-        attn_scores = (q.transpose(1,2) @ block_centers.transpose(1,2).transpose(2,3))
-        attn_scores = attn_scores.mean(dim=1)  # Average over heads
 
-        # Get blocks with scores above mean
-        mean_score = torch.mean(attn_scores)
-        selected_blocks = torch.where(attn_scores > mean_score)[1]  # Get block indices
-
-        # Create attention mask based on selected blocks
-        attn_mask = torch.full((q.shape[0], q.shape[2]), float('-inf'), device=q.device)
-        for block_idx in selected_blocks:
-            # Convert block index to position in original sequence
-            bt = block_idx // (blocks_w * blocks_h)
-            bh = (block_idx % (blocks_w * blocks_h)) // blocks_w
-            bw = block_idx % blocks_w
-            
-            # Get all token indices for this block
-            start_t = bt * first_level_block_size[2]
-            start_h = bh * first_level_block_size[1]
-            start_w = bw * first_level_block_size[0]
-            
-            for dt in range(first_level_block_size[2]):
-                for dh in range(first_level_block_size[1]):
-                    for dw in range(first_level_block_size[0]):
-                        t_idx = start_t + dt
-                        h_idx = start_h + dh
-                        w_idx = start_w + dw
-                        if t_idx < t and h_idx < h and w_idx < w:
-                            token_idx = t_idx * (h * w) + h_idx * w + w_idx
-                            attn_mask[:, token_idx] = 0  # Allow attention to these tokens
-
+        txt_len = txt_k.shape[1]
+        # Handle text tokens attention:
+        # 1. Text tokens can attend to all image tokens and text tokens
+        attn_mask = torch.cat((attn_mask, torch.ones_like(attn_mask[:, :txt_len, :])), dim=1)
+        # 2. Image tokens can attend to text tokens
+        attn_mask = torch.cat((attn_mask, torch.ones_like(attn_mask[..., :txt_len])), dim=-1)
+        # -------------------------------------------------------------------------------------
         # second level attention (TODO: implement)
         # img_k_second_level = rearrange(img_k, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
         # img_v_second_level = rearrange(img_v, "B L (K H D) -> K B L H D", K=3, H=self.heads_num)
         # -------------------------------------------------------------------------------------
 
-        
+        # use flex attention, init the flex attention
 
         # Run actual attention.
         # q = torch.cat((img_q, txt_q), dim=1)
@@ -479,7 +262,7 @@ class MMDoubleStreamBlock(nn.Module):
         
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
-            attn = attention(
+            attn = block_flex_attention(
                 q,
                 k,
                 v,
@@ -488,6 +271,7 @@ class MMDoubleStreamBlock(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=img_k.shape[0],
+                attn_mask=attn_mask,
             )
         else:
             attn = parallel_attention(
@@ -611,6 +395,10 @@ class MMSingleStreamBlock(nn.Module):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_kv: Optional[int] = None,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor] = None,
+        first_level_block_size: list = [5, 5, 3],
+        hwt: list = [45, 80, 33],
+        ULYSSES_DEGREE: int = 1,
+        attn_threshold: float = 0.2,
     ) -> torch.Tensor:
         mod_shift, mod_scale, mod_gate = self.modulation(vec).chunk(3, dim=-1)
         x_mod = modulate(self.pre_norm(x), shift=mod_shift, scale=mod_scale)
@@ -641,9 +429,49 @@ class MMSingleStreamBlock(nn.Module):
             cu_seqlens_q.shape[0] == 2 * x.shape[0] + 1
         ), f"cu_seqlens_q.shape:{cu_seqlens_q.shape}, x.shape[0]:{x.shape[0]}"
         
+        # -------------------------------------------------------------------------------------
+        # first level attention
+        t0 = time.time()
+        q = torch.cat((img_q, txt_q), dim=1)
+        # rearrange 
+        h, w, t = hwt[0], hwt[1], hwt[2]
+        w = w // ULYSSES_DEGREE # for multi-GPU
+
+        # Reshape k into blocks
+        blocks_h, blocks_w, blocks_t = h // first_level_block_size[0], w // first_level_block_size[1], t // first_level_block_size[2]
+        
+        # Reshape img_k into blocks
+        img_k_blocks, metadata = reshape_to_blocks(img_k, h, w, t, first_level_block_size)
+        
+        # Calculate block-wise attention scores
+        # Average within each block to get block representation
+        block_centers = img_k_blocks.mean(dim=2)  # [B, num_blocks, H, D]
+        
+        # Calculate attention scores
+        attn_scores = torch.matmul(q.transpose(1, 2), block_centers.transpose(1, 2).transpose(-2, -1))  # [B, L, H, num_blocks]
+        attn_scores = attn_scores.mean(dim=1)  # [B, L, num_blocks] - average over heads (H)
+
+        # Create attention mask and select top blocks
+        
+        # First create mask at block level (B, L, num_blocks)
+        percentage = 0.3
+        block_mask = (attn_scores > torch.topk(attn_scores, k=int(percentage * attn_scores.shape[-1])).values)
+
+        # Expand block mask to token level
+        tokens_per_block = first_level_block_size[0] * first_level_block_size[1] * first_level_block_size[2]
+        attn_mask = block_mask.repeat_interleave(tokens_per_block, dim=-1)
+
+        txt_len = txt_q.shape[1]
+        # Handle text tokens attention:
+        # 1. Text tokens can attend to all image tokens and text tokens
+        attn_mask = torch.cat((attn_mask, torch.ones_like(attn_mask[:, :txt_len, :])), dim=1)
+        # 2. Image tokens can attend to text tokens
+        attn_mask = torch.cat((attn_mask, torch.ones_like(attn_mask[..., :txt_len])), dim=-1)
+        # -------------------------------------------------------------------------------------
+
         # attention computation start
         if not self.hybrid_seq_parallel_attn:
-            attn = attention(
+            attn = block_flex_attention(
                 q,
                 k,
                 v,
@@ -652,6 +480,7 @@ class MMSingleStreamBlock(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=x.shape[0],
+                attn_mask=attn_mask,
             )
         else:
             attn = parallel_attention(
