@@ -59,37 +59,34 @@ def init_local_mask_flex(height, width, text_length, window_size, device):
     WIDTH = width
 
 def tensor_to_block_mask(mask_tensor, Q_LEN, KV_LEN, Q_BLOCK_SIZE, KV_BLOCK_SIZE):
-    start_time = time.time()
     # just use a full mask for now
-    # full_mask = torch.ones_like(mask_tensor, dtype=torch.bool)
+    full_mask = torch.ones_like(mask_tensor, dtype=torch.bool)
     # TODO: merge the mask_mod function with the models_mul.py's repeat_interleave mode.
     BLOCK_SIZE_PER = 128
     # print("original mask percentage: ", mask_tensor.sum()/mask_tensor.numel())
     def mask_mod(b, h, q_idx, kv_idx):
+        
         # print(q_idx, kv_idx)
         # 1. txt tokens can attend to all image tokens and text tokens
-        kv_mask_idx = kv_idx // BLOCK_SIZE_PER
+        kv_mask_idx = kv_idx // KV_BLOCK_SIZE
+        q_mask_idx = q_idx // Q_BLOCK_SIZE
+        return full_mask[q_mask_idx, kv_mask_idx]
+    
         return torch.logical_or(
             q_idx >= 880*BLOCK_SIZE_PER,
             torch.logical_or(
                 kv_idx >= 880*BLOCK_SIZE_PER,
-                mask_tensor[q_idx, kv_mask_idx]==True,
+                mask_tensor[q_mask_idx, kv_mask_idx]==True,
             )
         )
-        # # 2. image tokens: return quantized mask
-        # q_mask_idx = q_idx // BLOCK_SIZE_PER
-        # kv_mask_idx = kv_idx // BLOCK_SIZE_PER
-        # return mask_tensor[q_mask_idx, kv_mask_idx]
     
-    print("mask_tensor shape: ", mask_tensor.shape, mask_tensor.device)
-    print("mask_tensor shape: ", mask_tensor.shape, mask_tensor.device)
     block_mask = create_block_mask(mask_mod, B=None, H=None, device=mask_tensor.device,
                                    Q_LEN=Q_LEN, 
                                    KV_LEN=KV_LEN,
-                                   # BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
+                                   BLOCK_SIZE=(Q_BLOCK_SIZE, KV_BLOCK_SIZE),
                                    _compile=True)
-    end_time = time.time()
-    print(f"tensor_to_block_mask time: {end_time - start_time} seconds")
+    # print sparsity
+    # print("block_mask sparsity: ", block_mask.sparsity)
     return block_mask
 
 def block_flex_attention(
@@ -101,7 +98,7 @@ def block_flex_attention(
     attn_mask=None,
     block_mask=None,
     causal=False,
-    proportional_attention=True,
+    proportional_attention=False,
     KV_BLOCK_SIZE=128,
     Q_BLOCK_SIZE=128,
     cu_seqlens_q=None,
@@ -119,24 +116,26 @@ def block_flex_attention(
         if attn_mask is not None:
             if attn_mask.dtype != torch.bool:
                 attn_mask = attn_mask.to(q.dtype)
-            print("attn_mask shape: ", attn_mask.shape)
-            print("qkv shape: ", q.shape, k.shape, v.shape)
+            
             block_mask = tensor_to_block_mask(attn_mask, Q_LEN=q.size(2), KV_LEN=k.size(2), Q_BLOCK_SIZE=Q_BLOCK_SIZE, KV_BLOCK_SIZE=KV_BLOCK_SIZE)
+            # calculate the compile time...
+            t = time.time()
             attn_func = partial(flex_attention, block_mask=block_mask)
             attn_func = torch.compile(attn_func, dynamic=False)
-            print(block_mask)
-            print("block_mask shape: ", block_mask.shape)
+            # print(f"compile time: {time.time() - t}")
+            # print(block_mask)
 
         train_seq_len = q.size(2)
         head_dim = q.size(1)
-        print("qkv shape after transpose: ", q.shape, k.shape, v.shape)
+
         if proportional_attention:
             attention_scale = math.sqrt(math.log(10 * k.size(2), train_seq_len) / head_dim)
         else:
             attention_scale = math.sqrt(1 / head_dim)
         x = attn_func(
             q, k, v, scale=attention_scale
-        )
+        )# .permute(0, 2, 1, 3)
+        
     else:
         raise NotImplementedError(f"Unsupported attention mode: {mode}")
 

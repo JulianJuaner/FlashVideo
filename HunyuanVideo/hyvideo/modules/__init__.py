@@ -1,4 +1,5 @@
 from .models_mul import HYVideoDiffusionTransformer, HUNYUAN_VIDEO_CONFIG
+# from .models import HYVideoDiffusionTransformer, HUNYUAN_VIDEO_CONFIG
 
 
 def load_model(args, in_channels, out_channels, factor_kwargs):

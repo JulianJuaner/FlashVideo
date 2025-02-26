@@ -20,6 +20,17 @@ from .token_refiner import SingleTokenRefiner
 from .tensor_ops import reshape_to_blocks, reshape_from_blocks
 from .attenion_block_flex import block_flex_attention
 
+def get_top_k_percentile_threshold(tensor, k=10):
+    # 将tensor压平成1维
+    flattened = tensor.flatten()
+    
+    # 计算需要取的位置
+    k_index = int(len(flattened) * (100 - k) / 100)
+    
+    # 获取第k%位置的值
+    threshold = torch.sort(flattened, descending=True)[0][k_index]
+    
+    return threshold
 
 class MMDoubleStreamBlock(nn.Module):
     """
@@ -212,21 +223,18 @@ class MMDoubleStreamBlock(nn.Module):
         
         # Reshape img_k into blocks
         # img_k_blocks, metadata = reshape_to_blocks(img_k, h, w, t, first_level_block_size) # [1, 880, 128, 24, 128]
-        img_k_blocks = rearrange(img_k, "B (b_t t b_h h b_w w) H D -> B (t h w) (b_t b_h b_w) H D",
+        img_k_blocks = rearrange(img_k, "B (t b_t h b_h w b_w) H D -> B (t h w) (b_t b_h b_w) H D",
                                     t=blocks_t, w=blocks_w, h=blocks_h,
                                     b_t=first_level_block_size[2], b_w=first_level_block_size[1], b_h=first_level_block_size[0],
                                     H=self.heads_num)
-        
-        print("img_k_blocks shape: ", img_k_blocks.shape)
-        img_v = rearrange(img_v, "B (b_t t b_h h b_w w) H D -> B (t h w b_t b_h b_w) H D",
+        img_v = rearrange(img_v, "B (t b_t h b_h w b_w) H D -> B (t h w b_t b_h b_w) H D",
                                     t=blocks_t, w=blocks_w, h=blocks_h,
                                     b_t=first_level_block_size[2], b_w=first_level_block_size[1], b_h=first_level_block_size[0],
                                     H=self.heads_num)
-        img_q = rearrange(img_q, "B (b_t t b_h h b_w w) H D -> B (t h w b_t b_h b_w) H D",
+        img_q = rearrange(img_q, "B (t b_t h b_h w b_w) H D -> B (t h w b_t b_h b_w) H D",
                                 t=blocks_t, w=blocks_w, h=blocks_h,
                                 b_t=first_level_block_size[2], b_w=first_level_block_size[1], b_h=first_level_block_size[0],
                                 H=self.heads_num)
-        print("img_q_blocks shape: ", img_q.shape)
         q = torch.cat((img_q, txt_q), dim=1)
 
         # Calculate block-wise attention scores
@@ -234,24 +242,27 @@ class MMDoubleStreamBlock(nn.Module):
         block_centers = img_k_blocks.mean(dim=2)  # [B, num_blocks, H, D]
         
         # Calculate attention scores
-        attn_scores = torch.matmul(q.transpose(1, 2), block_centers.transpose(1, 2).transpose(-2, -1))  # [B, L, H, num_blocks]
+        attn_scores = torch.matmul(q.transpose(1, 2), block_centers.transpose(1, 2).transpose(-2, -1))  # [B, H, L, num_blocks]
+
         attn_scores = attn_scores.mean(dim=1)  # [B, L, num_blocks] - average over heads (H)
-        
+ 
         # Select top blocks based on attention scores
-        percentage = 0.3  # Keep top 0.1% of blocks
-        k = max(1, int(percentage * attn_scores.shape[-1]))  # Ensure at least 1 block is selected
-        
-        # Get top-k values for thresholding
-        topk_values, _ = torch.topk(attn_scores, k=k, dim=-1)  # [B, L, k]
-        # Use the smallest value among top-k as threshold
-        threshold = torch.min(topk_values)  # [B, L, 1]
-        # Create mask based on threshold
-        block_mask = (attn_scores > threshold)  # [B, L, num_blocks]
+        attn_mean = attn_scores.mean()
+        topk_value = get_top_k_percentile_threshold(attn_scores, k=90)
+        # the threshold is the top 30% value
+        block_mask = (attn_scores > attn_mean)
 
         # Ensure text tokens can attend to all blocks
         txt_len = txt_k.shape[1]
         block_mask[:, -txt_len:, :] = torch.ones_like(block_mask[:, -txt_len:, :])
         block_mask = torch.cat((block_mask, torch.ones_like(block_mask[..., :2])), dim=-1)
+        
+        # resize with 16 times downsampling on q.
+        block_mask_down = rearrange(block_mask, "B (Q L) K -> B L Q K", L=128)
+        block_mask_down = torch.mean(block_mask_down.float(), dim=1)
+        block_mask_down = (block_mask_down > 0.5).bool()
+        
+        # print("block_wise_percentage: ", block_mask_down.sum() / block_mask_down.numel())
         # Expand block mask to token level
         '''
         tokens_per_block = first_level_block_size[0] * first_level_block_size[1] * first_level_block_size[2]
@@ -269,7 +280,7 @@ class MMDoubleStreamBlock(nn.Module):
         attn_mask = torch.cat((attn_mask, torch.ones_like(attn_mask[..., -txt_len:])), dim=-1)
         '''
 
-        img_k = rearrange(img_k, "B (b_t t b_h h b_w w) H D -> B (t h w b_t b_h b_w) H D",
+        img_k = rearrange(img_k, "B (t b_t h b_h w b_w) H D -> B (t h w b_t b_h b_w) H D",
                                 t=blocks_t, w=blocks_w, h=blocks_h,
                                 b_t=first_level_block_size[2], b_w=first_level_block_size[1], b_h=first_level_block_size[0],
                                 H=self.heads_num)
@@ -301,7 +312,7 @@ class MMDoubleStreamBlock(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=img_k.shape[0],
-                attn_mask=block_mask[0]#attn_mask,
+                attn_mask=block_mask_down[0]#attn_mask,
             )
         else:
             attn = parallel_attention(
@@ -471,44 +482,82 @@ class MMSingleStreamBlock(nn.Module):
         # -------------------------------------------------------------------------------------
         # first level attention
         t0 = time.time()
-        q = torch.cat((img_q, txt_q), dim=1)
         # rearrange 
         h, w, t = hwt[0], hwt[1], hwt[2]
         w = w // ULYSSES_DEGREE # for multi-GPU
 
         # Reshape k into blocks
+        t1 = time.time()
         blocks_h, blocks_w, blocks_t = h // first_level_block_size[0], w // first_level_block_size[1], t // first_level_block_size[2]
         
         # Reshape img_k into blocks
-        img_k_blocks, metadata = reshape_to_blocks(img_k, h, w, t, first_level_block_size)
-        
+        # img_k_blocks, metadata = reshape_to_blocks(img_k, h, w, t, first_level_block_size) # [1, 880, 128, 24, 128]
+        img_q, txt_q = q[:, :-txt_len, :, :], q[:, -txt_len:, :, :]
+        img_k, txt_k = k[:, :-txt_len, :, :], k[:, -txt_len:, :, :]
+        img_v, txt_v = v[:, :-txt_len, :, :], v[:, -txt_len:, :, :]
+        img_k_blocks = rearrange(img_k, "B (t b_t h b_h w b_w) H D -> B (t h w) (b_t b_h b_w) H D",
+                                    t=blocks_t, w=blocks_w, h=blocks_h,
+                                    b_t=first_level_block_size[2], b_w=first_level_block_size[1], b_h=first_level_block_size[0],
+                                    H=self.heads_num)
+        img_v = rearrange(img_v, "B (t b_t h b_h w b_w) H D -> B (t h w b_t b_h b_w) H D",
+                                    t=blocks_t, w=blocks_w, h=blocks_h,
+                                    b_t=first_level_block_size[2], b_w=first_level_block_size[1], b_h=first_level_block_size[0],
+                                    H=self.heads_num)
+        img_q = rearrange(img_q, "B (t b_t h b_h w b_w) H D -> B (t h w b_t b_h b_w) H D",
+                                t=blocks_t, w=blocks_w, h=blocks_h,
+                                b_t=first_level_block_size[2], b_w=first_level_block_size[1], b_h=first_level_block_size[0],
+                                H=self.heads_num)
+        q = torch.cat((img_q, txt_q), dim=1)
+
         # Calculate block-wise attention scores
         # Average within each block to get block representation
         block_centers = img_k_blocks.mean(dim=2)  # [B, num_blocks, H, D]
         
         # Calculate attention scores
-        attn_scores = torch.matmul(q.transpose(1, 2), block_centers.transpose(1, 2).transpose(-2, -1))  # [B, L, H, num_blocks]
+        attn_scores = torch.matmul(q.transpose(1, 2), block_centers.transpose(1, 2).transpose(-2, -1))  # [B, H, L, num_blocks]
+
         attn_scores = attn_scores.mean(dim=1)  # [B, L, num_blocks] - average over heads (H)
-
-        # Create attention mask and select top blocks
-        
-        # First create mask at block level (B, L, num_blocks)
-         # top 30% value:
-        topk_values = torch.topk(attn_scores, k=int(percentage * attn_scores.shape[-1])).values
+ 
+        # Select top blocks based on attention scores
+        attn_mean = attn_scores.mean()
+        topk_value = get_top_k_percentile_threshold(attn_scores, k=90)
         # the threshold is the top 30% value
-        threshold = topk_values[..., -1:]
-        block_mask = (attn_scores > threshold)
+        block_mask = (attn_scores > attn_mean)
 
+        # Ensure text tokens can attend to all blocks
+        txt_len = txt_k.shape[1]
+        block_mask[:, -txt_len:, :] = torch.ones_like(block_mask[:, -txt_len:, :])
+        block_mask = torch.cat((block_mask, torch.ones_like(block_mask[..., :2])), dim=-1)
+        
+        # resize with 16 times downsampling on q.
+        block_mask_down = rearrange(block_mask, "B (Q L) K -> B L Q K", L=128)
+        block_mask_down = torch.mean(block_mask_down.float(), dim=1)
+        block_mask_down = (block_mask_down > 0.5).bool()
+        
+        # print("block_wise_percentage_new: ", block_mask_down.sum() / block_mask_down.numel())
         # Expand block mask to token level
+        '''
         tokens_per_block = first_level_block_size[0] * first_level_block_size[1] * first_level_block_size[2]
         attn_mask = block_mask.repeat_interleave(tokens_per_block, dim=-1)
+        
+        print(attn_mask[0][0], attn_mask[0][0].sum())
+        # print(f"percentage2: {attn_mask.sum() / attn_mask.numel()}")
+        
 
-        txt_len = txt_q.shape[1]
+        txt_len = txt_k.shape[1]
         # Handle text tokens attention:
         # 1. Text tokens can attend to all image tokens and text tokens
-        attn_mask[:, :txt_len, :] = torch.ones_like(attn_mask[:, :txt_len, :])
+        attn_mask[:, -txt_len:, :] = torch.ones_like(attn_mask[:, -txt_len:, :])
         # 2. Image tokens can attend to text tokens
-        attn_mask = torch.cat((attn_mask, torch.ones_like(attn_mask[..., :txt_len])), dim=-1)
+        attn_mask = torch.cat((attn_mask, torch.ones_like(attn_mask[..., -txt_len:])), dim=-1)
+        '''
+
+        img_k = rearrange(img_k, "B (t b_t h b_h w b_w) H D -> B (t h w b_t b_h b_w) H D",
+                                t=blocks_t, w=blocks_w, h=blocks_h,
+                                b_t=first_level_block_size[2], b_w=first_level_block_size[1], b_h=first_level_block_size[0],
+                                H=self.heads_num)
+        k = torch.cat((img_k, txt_k), dim=1)
+        v = torch.cat((img_v, txt_v), dim=1)
         # -------------------------------------------------------------------------------------
 
         # attention computation start
@@ -522,7 +571,7 @@ class MMSingleStreamBlock(nn.Module):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=max_seqlen_kv,
                 batch_size=x.shape[0],
-                attn_mask=attn_mask,
+                attn_mask=block_mask_down[0],
             )
         else:
             attn = parallel_attention(
@@ -538,8 +587,14 @@ class MMSingleStreamBlock(nn.Module):
         # attention computation end
 
         # Compute activation in mlp stream, cat again and run second linear layer.
-        output = self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2))
-        return x + apply_gate(output, gate=mod_gate)
+        output = apply_gate(self.linear2(torch.cat((attn, self.mlp_act(mlp)), 2)))
+        output_img, output_txt = torch.split(output, [img_q.shape[1], txt_q.shape[1]], dim=1)
+        output_img = rearrange(output_img, "B (t h w b_t b_h b_w) D -> B (b_t t b_h h b_w w) D",
+                        t=blocks_t, w=blocks_w, h=blocks_h,
+                        b_t=first_level_block_size[2], b_w=first_level_block_size[1], b_h=first_level_block_size[0],
+                        )
+        
+        return x + torch.cat((output_img, output_txt), dim=1)
 
 
 class HYVideoDiffusionTransformer(ModelMixin, ConfigMixin):
